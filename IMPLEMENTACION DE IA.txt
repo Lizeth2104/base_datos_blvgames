@@ -1,0 +1,293 @@
+<?php
+header('Content-Type: application/json');
+require_once '../config/gemini_config.php';
+require_once '../config/conexion.php';  // conexión a la base de datos
+
+$input = json_decode(file_get_contents('php://input'), true);
+$userMessage = $input['message'] ?? '';
+
+if (empty($userMessage)) {
+    echo json_encode([
+        'success' => false,
+        'error' => 'No se proporcionó ningún mensaje'
+    ]);
+    exit;
+}
+
+
+$categoriaFiltroId = 0;
+$nombreCategoriaFiltro = '';
+
+if (function_exists('apcu_fetch')) {
+    $categoriasDisponibles = apcu_fetch('blv_categorias');
+    if ($categoriasDisponibles === false) {
+        $categoriasDisponibles = [];
+        $tmp = $conexion->query("SELECT IdCategoria, Nombre FROM categorias");
+        if ($tmp) {
+            while ($rowCat = $tmp->fetch_assoc()) {
+                $categoriasDisponibles[strtolower($rowCat['Nombre'])] = (int)$rowCat['IdCategoria'];
+            }
+        }
+        apcu_store('blv_categorias', $categoriasDisponibles, 300); 
+    }
+} else {
+    
+    $categoriasDisponibles = [];
+    $tmp = $conexion->query("SELECT IdCategoria, Nombre FROM categorias");
+    if ($tmp) {
+        while ($rowCat = $tmp->fetch_assoc()) {
+            $categoriasDisponibles[strtolower($rowCat['Nombre'])] = (int)$rowCat['IdCategoria'];
+        }
+    }
+}
+
+foreach ($categoriasDisponibles as $nombreCat => $idCat) {
+    if (stripos($userMessage, $nombreCat) !== false) {
+        $categoriaFiltroId = $idCat;
+        $nombreCategoriaFiltro = $nombreCat;
+        break;
+    }
+}
+
+
+$listaJuegos = [];
+$queryJuegos = "SELECT Titulo FROM videojuegos WHERE Activo = 1" . ($categoriaFiltroId ? " AND IdCategoria = " . $categoriaFiltroId : "");
+if ($resultadoJuegos = $conexion->query($queryJuegos)) {
+    while ($rowJuego = $resultadoJuegos->fetch_assoc()) {
+        $listaJuegos[] = $rowJuego['Titulo'];
+    }
+}
+
+
+$normalizedTitles = [];
+foreach ($listaJuegos as $tituloOriginal) {
+    $normalizedTitles[strtolower(preg_replace('/[^a-z0-9]/i', '', $tituloOriginal))] = $tituloOriginal;
+}
+
+
+$palabrasUsuario = preg_split('/\s+/', $userMessage);
+foreach ($palabrasUsuario as $palabra) {
+    $cleanWord = strtolower(preg_replace('/[^a-z0-9]/i', '', $palabra));
+    if ($cleanWord === '') {
+        continue;
+    }
+    foreach ($normalizedTitles as $tituloNorm => $tituloOriginal) {
+        $dist = levenshtein($cleanWord, $tituloNorm);
+        if ($dist > 0 && $dist <= 2) { 
+            $userMessage = preg_replace('/\b' . preg_quote($palabra, '/') . '\b/i', $tituloOriginal, $userMessage);
+            break 2; 
+        }
+    }
+}
+
+if ($listaJuegos) {
+    $maxToShow = 40; 
+    $listaRecortada = array_slice($listaJuegos, 0, $maxToShow);
+    $textoListaJuegos = "Lista de juegos" . ($nombreCategoriaFiltro ? " de la categoría '{$nombreCategoriaFiltro}'" : " disponibles actualmente") . ": " . implode(', ', $listaRecortada);
+    if (count($listaJuegos) > $maxToShow) {
+        $textoListaJuegos .= ' y ' . (count($listaJuegos) - $maxToShow) . ' más.';
+    } else {
+        $textoListaJuegos .= '.';
+    }
+} else {
+    $textoListaJuegos = "No se encontraron juegos" . ($nombreCategoriaFiltro ? " en la categoría solicitada." : " registrados.");
+}
+
+
+$systemContext = "Eres GameBot, el asistente virtual de blvgames.bo, una plataforma de venta y distribución de videojuegos independientes. Tu objetivo es ayudar a los usuarios a encontrar juegos y brindar información concreta y veraz sobre la plataforma y sus desarrolladores. Evita repetir información irrelevante (por ejemplo, no recalques constantemente el origen boliviano de los desarrolladores a menos que sea pertinente). Sé amigable, directo y responde siempre en español.\n\n" . $textoListaJuegos;
+
+
+$mensajeLower = strtolower($userMessage);
+foreach ($listaJuegos as $tituloJuego) {
+    $tituloLower = strtolower($tituloJuego);
+    if (strpos($mensajeLower, $tituloLower) !== false) {
+        
+        if (preg_match('/\b(tienen|disponible|venden|hay)\b/', $mensajeLower)) {
+            echo json_encode([
+                'success'  => true,
+                'response' => "¡Hola! Sí, $tituloJuego está disponible en nuestro catálogo. ¿Necesitas más detalles o ayuda para realizar la compra?"
+            ]);
+            return;
+        }
+       
+        if (strpos($mensajeLower, 'requisitos') !== false) {
+            
+            $reqQuery = $conexion->prepare("SELECT RequisitosMinimos FROM requisitos_juego WHERE Titulo = ? LIMIT 1");
+            if ($reqQuery) {
+                $reqQuery->bind_param('s', $tituloJuego);
+                $reqQuery->execute();
+                $reqQuery->bind_result($reqMin);
+                if ($reqQuery->fetch() && $reqMin) {
+                    echo json_encode([
+                        'success'  => true,
+                        'response' => "Requisitos mínimos para $tituloJuego en PC:\n$reqMin"
+                    ]);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+
+$fullPrompt = $systemContext . "\n\nUsuario: " . $userMessage . "\n\nAsistente:";
+
+
+$data = [
+    'contents' => [
+        [
+            'parts' => [
+                ['text' => $fullPrompt]
+            ]
+        ]
+    ],
+    'generationConfig' => [
+        'temperature' => 0.7,
+        'maxOutputTokens' => 400,
+        'responseModalities' => ['TEXT']
+    ],
+    'systemInstruction' => [
+        'parts' => [
+            ['text' => 'Responde de forma directa y concisa. No uses razonamiento interno.']
+        ]
+    ]
+];
+
+
+$url = GEMINI_API_URL . '?key=' . GEMINI_API_KEY;
+$jsonData = json_encode($data);
+
+
+if (function_exists('curl_init')) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonData);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json'
+    ]);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    
+    if ($curlError) {
+        echo json_encode([
+            'success' => false,
+            'error' => 'Error de CURL: ' . $curlError
+        ]);
+        exit;
+    }
+} else {
+    
+    $options = [
+        'http' => [
+            'method' => 'POST',
+            'header' => 'Content-Type: application/json',
+            'content' => $jsonData,
+            'ignore_errors' => true
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false
+        ]
+    ];
+    $context = stream_context_create($options);
+    $response = file_get_contents($url, false, $context);
+    $httpCode = 200;
+}
+
+if (!$response || $httpCode !== 200) {
+    $errorDetails = 'Código HTTP: ' . $httpCode;
+    if ($response) {
+        $errorData = json_decode($response, true);
+        if (isset($errorData['error']['message'])) {
+            $errorDetails .= ' - ' . $errorData['error']['message'];
+        }
+    }
+    
+    echo json_encode([
+        'success' => false,
+        'error' => 'Error al comunicarse con Gemini AI',
+        'details' => $errorDetails,
+        'httpCode' => $httpCode
+    ]);
+    exit;
+}
+
+$result = json_decode($response, true);
+
+
+if (isset($result['candidates'][0]['content']['parts'][0]['text'])) {
+    $botResponse = $result['candidates'][0]['content']['parts'][0]['text'];
+    echo json_encode([
+        'success' => true,
+        'response' => $botResponse
+    ]);
+} else if (isset($result['candidates'][0])) {
+   
+    $candidate = $result['candidates'][0];
+    $finishReason = $candidate['finishReason'] ?? 'UNKNOWN';
+    
+    if ($finishReason === 'MAX_TOKENS') {
+       
+        $data['generationConfig']['maxOutputTokens'] = 1200;
+        $data['systemInstruction']['parts'][0]['text'] .= ' Limita tu respuesta a un máximo de 8 líneas.';
+        $retryJson = json_encode($data);
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $retryJson);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            $retryResponse = curl_exec($ch);
+            curl_close($ch);
+        } else {
+            $optionsRetry = [
+                'http' => [
+                    'method' => 'POST',
+                    'header' => 'Content-Type: application/json',
+                    'content' => $retryJson,
+                    'ignore_errors' => true
+                ],
+                'ssl' => [
+                    'verify_peer' => false,
+                    'verify_peer_name' => false
+                ]
+            ];
+            $contextRetry = stream_context_create($optionsRetry);
+            $retryResponse = file_get_contents($url, false, $contextRetry);
+        }
+
+        $retryResult = json_decode($retryResponse, true);
+        if (isset($retryResult['candidates'][0]['content']['parts'][0]['text'])) {
+            echo json_encode([
+                'success' => true,
+                'response' => $retryResult['candidates'][0]['content']['parts'][0]['text'],
+                'warning' => 'La respuesta fue resumida automáticamente debido a su longitud.'
+            ]);
+        } else {
+            echo json_encode([
+                'success' => false,
+                'error' => 'La respuesta fue demasiado extensa incluso tras un intento de resumen. Por favor, haz una pregunta más específica.'
+            ]);
+        }
+    } else {
+        echo json_encode([
+            'success' => false,
+            'error' => 'No se pudo generar una respuesta completa',
+            'details' => 'Finish reason: ' . $finishReason
+        ]);
+    }
+} else {
+    echo json_encode([
+        'success' => false,
+        'error' => 'No se pudo obtener una respuesta de Gemini AI',
+        'details' => isset($result['error']) ? $result['error']['message'] : 'Error desconocido'
+    ]);
+}
+?>
